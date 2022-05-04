@@ -8,7 +8,7 @@
 #include <stdlib.h>
 #include <thread>
 #include <mutex>
-
+#include <condition_variable>
 
 #include <orbis/libkernel.h>
 #include <orbis/AudioOut.h>
@@ -176,29 +176,38 @@ TrueHDHeader truehd_parse(const uint8_t* in_buf, int buf_size)
 
 
 
-#define USER_GRAIN 1280
+#define USER_GRAIN 1024
 
 //audiobuf size = channel * USER_GRAIN * sizeof(float)
 #define AUDIO_BUF_LEN  (8 * USER_GRAIN * 4)
 
 std::mutex buf_mutex;
+std::condition_variable buf_cond;
 
-int audio;
+CircularBuffer audio_cb;
 
-CircularBuffer cb;
 
-uint8_t audiobuf[AUDIO_BUF_LEN];
+void playthread(void){
 
-void playthread(){
+	int rc;
+
+	rc = sceAudioOutInit();
+	if (rc != 0)
+	{
+		printf("[ERROR] Failed to initialize audio output\n");
+		return;
+	}
 
 
 	OrbisUserServiceUserId userId = ORBIS_USER_SERVICE_USER_ID_SYSTEM;
 	int audio=  sceAudioOutOpen(userId, ORBIS_AUDIO_OUT_PORT_TYPE_MAIN, 0, USER_GRAIN, 48000,ORBIS_AUDIO_OUT_PARAM_FORMAT_FLOAT_8CH);
 
-        if(audio<0){
-                printf("sceAudioOutOpen failed\n");
-                return ;
-        }
+	if(audio<0){
+		printf("sceAudioOutOpen failed\n");
+		return ;
+	}
+
+	uint8_t* audiobuf=(uint8_t* )malloc(AUDIO_BUF_LEN*sizeof(uint8_t));
 
 
 
@@ -206,96 +215,62 @@ void playthread(){
 
 
 
-		int size=CircularBufferGetDataSize(cb); 
+		int size=CircularBufferGetDataSize(audio_cb); 
 
 		if(size<AUDIO_BUF_LEN){
-			sleep(1);}
-		else{
-			memset(audiobuf,0,sizeof(audiobuf));
+			std::unique_lock <std::mutex> lck(buf_mutex);
+			buf_cond.wait(lck);	
+		
+		}
 
-			buf_mutex.lock();
-			CircularBufferPop(cb, AUDIO_BUF_LEN, audiobuf);
-			buf_mutex.unlock();
+			CircularBufferPop(audio_cb, AUDIO_BUF_LEN, audiobuf);
 
 			sceAudioOutOutput(audio, audiobuf);
 
-		}
 	}
+
+	sceAudioOutClose(audio);
+
+	free(audiobuf);
 
 }
 
+void recvthread(void){
 
-int main(void)
-{
+	socklen_t addrLen;
 
-	OrbisUserServiceUserId userId = ORBIS_USER_SERVICE_USER_ID_SYSTEM;
+	struct sockaddr_in serverAddr;
 
-	sceUserServiceInitialize(NULL);
+	int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
 
+	if (sockfd < 0)
+	{
+		printf("Failed to create socket:");
+		return;
+	}
+
+	memset(&serverAddr, 0, sizeof(serverAddr));
+	serverAddr.sin_family = AF_INET;
+	serverAddr.sin_addr.s_addr = htonl(INADDR_ANY);
+	serverAddr.sin_port = htons(7721);
+
+	if (bind(sockfd, (struct sockaddr*)&serverAddr, sizeof(serverAddr)) != 0)
+	{
+		printf("Failed to bind to 0.0.0.0\n");
+		return;
+	}
+
+
+
+	int read_byte = 0;
 	int rc;
-	rc = sceSysmoduleLoadModule(0x0088);
 
-	if (rc < 0)
-	{
-		printf("[ERROR] Failed to load audiodec module\n");
-		return rc;
-	}
-
-	printf("sceSysmoduleLoadModule ok\n");
-
-	rc = sceAudioOutInit();
-	if (rc != 0)
-	{
-		printf("[ERROR] Failed to initialize audio output\n");
-		return rc;
-	}
-
-	printf("sceAudioOutInit ok\n");
-
-	FILE* file = fopen("/app0/assets/audio/sample.thd", "rb");
-
-	if(!file){
-		printf("[ERROR] Failed to fopen\n");
-
-		return -1;
-	}
-
-	fseek(file, 0, SEEK_END);
-	uint32_t inputFileSize = (uint32_t)ftell(file);
-
-	printf("inputFileSize:%u\n",inputFileSize);
-	fseek(file, 0, SEEK_SET);
-
-
-	uint32_t inputBufferSize=inputFileSize+1;
-
-	unsigned char* inputBuffer = (unsigned char*)malloc(inputBufferSize);
-
-	int len = fread(inputBuffer, 1, inputFileSize, file);
-	
-	fclose(file);
-
-
-
-
-	TrueHDHeader head =truehd_parse(inputBuffer,inputFileSize);
-
-	if(!head.is_truehd){
-		printf("not truehd file\n");
-		return -1;
-
-	}
-
-
-	printf("sample_rate:%u\n",head.samplingFrequency);
-	printf("channel:%d\n",head.numChannels);
 
 	rc = sceAudiodecInitLibrary(ORBIS_AUDIO_DEC_CODEC_DolbyTrueHD);
-	if(rc<0){
-		printf("sceAudiodecInitLibrary DolbyTrueHD failed\n");
-		return -1;
-	}
-
+        if(rc<0){
+                printf("sceAudiodecInitLibrary DolbyTrueHD failed\n");
+                return;
+        }
 
 
 	SceAudiodecParamDolbyTrueHD param_DolbyTrueHD;
@@ -303,7 +278,6 @@ int main(void)
 
 	SceAudiodecDolbyTrueHDInfo info_DolbyTrueHD;
 	memset(&info_DolbyTrueHD,0,sizeof(SceAudiodecDolbyTrueHDInfo));
-
 
 
 	SceAudiodecCtrl ctrl;
@@ -332,47 +306,33 @@ int main(void)
 
 	rc = sceAudiodecCreateDecoder((OrbisAudiodecCtrl *)&ctrl, ORBIS_AUDIO_DEC_CODEC_DolbyTrueHD);
 
+
 	if(rc<0){
 		printf("sceAudiodecCreateDecoder failed. ret:%08x\n",rc);
-		return -1;
+		return ;
 	}
 
 	int32_t handle=rc;
 	const uint32_t maxAuSize = ORBIS_AUDIODEC_DolbyTrueHD_MAX_FRAME_SIZE;
 	const uint32_t maxPcmSize =sizeof(float)* ORBIS_AUDIODEC_DolbyTrueHD_MAX_NFRAME * ORBIS_AUDIODEC_DolbyTrueHD_MAX_CHANNELS_FOR_8CH * ORBIS_AUDIODEC_DolbyTrueHD_MAX_FRAME_SAMPLES;
 
-	int pcm_buf_num=2;
-	int pcm_buf_head=0;
-	uint8_t* pcm_buf[2];
-	for(int i=0;i<pcm_buf_num;i++){
-		pcm_buf[i]=(uint8_t*)malloc(maxPcmSize);
-
-	}
-
-	uint32_t inputSize = 0;
-
-
-	cb = CircularBufferCreate(AUDIO_BUF_LEN*3);
-
-	std::thread play(playthread);
-
+	uint8_t* pcm_buf=(uint8_t*)malloc(maxPcmSize*sizeof(uint8_t));
+	uint8_t* recv_buf=(uint8_t*)malloc(maxAuSize*sizeof(uint8_t));
 
 	while(1){
 
+		memset(recv_buf,0,ORBIS_AUDIODEC_DolbyTrueHD_MAX_FRAME_SIZE);
+		memset(pcm_buf,0,maxPcmSize);
 
+		read_byte = recv(sockfd, recv_buf,maxAuSize, 0);
 
-		int size=CircularBufferGetDataSize(cb);
-		if(size>= AUDIO_BUF_LEN*2){
+		if(read_byte<=0){
 			continue;
-		
 		}
 
-
-		memset(pcm_buf[pcm_buf_head],0,maxPcmSize);
-
-		au.pAuAddr = inputBuffer + inputSize;
-		au.uiAuSize = maxAuSize;
-		pcm.pPcmAddr = pcm_buf[pcm_buf_head];
+		au.pAuAddr = recv_buf;
+		au.uiAuSize = read_byte;
+		pcm.pPcmAddr = pcm_buf;
 		pcm.uiPcmSize = maxPcmSize;
 
 		rc = sceAudiodecDecode(handle, (OrbisAudiodecCtrl *)&ctrl);
@@ -382,45 +342,60 @@ int main(void)
 			break;
 		}
 
-		buf_mutex.lock();
 
-		CircularBufferPush(cb,pcm_buf[pcm_buf_head],pcm.uiPcmSize);
+		CircularBufferPush(audio_cb,pcm_buf,pcm.uiPcmSize);
 
-		buf_mutex.unlock();
-
-
-
-		inputSize += au.uiAuSize;
-
-		//loop play
-		if(inputSize>=inputFileSize){
-			inputSize=0;
-		}
-
-
-
-		pcm_buf_head = (pcm_buf_head + 1) % pcm_buf_num;
-		
+		int size=CircularBufferGetDataSize(audio_cb);
+		 if(size>=AUDIO_BUF_LEN){
+			buf_cond.notify_one();
+                }
 
 
 
 	}
 
-
-
-
-
-	for (;;) {}
-
-
 	sceAudiodecDeleteDecoder(handle);
 	sceAudiodecTermLibrary(ORBIS_AUDIO_DEC_CODEC_DolbyTrueHD);
-	free(inputBuffer);
+	free(pcm_buf);
+	free(recv_buf);
 
-	for(int i=0;i<pcm_buf_num;i++){
-                free(pcm_buf[i]);
 
-        }
+}
+
+//ffmpeg -re -i filename -map 0:a:0 -c:a copy -bsf:a truehd_core -f truehd udp://xxx.xxx.xxx.xxx:7721
+
+int main(void)
+{
+
+
+	sceUserServiceInitialize(NULL);
+
+	int rc;
+	rc = sceSysmoduleLoadModule(0x0088);
+
+	if (rc < 0)
+	{
+		printf("[ERROR] Failed to load audiodec module\n");
+		return rc;
+	}
+
+	printf("sceSysmoduleLoadModule ok\n");
+
+
+	audio_cb = CircularBufferCreate(AUDIO_BUF_LEN*3);
+	//recv_cb= CircularBufferCreate(ORBIS_AUDIODEC_DolbyTrueHD_MAX_FRAME_SIZE*3);
+
+	std::thread play_thread(playthread);
+	std::thread recv_thread(recvthread);
+
+
+	while(true){
+
+		sleep(1);
+		
+
+	}
+
 
 
 }
